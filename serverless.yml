@@ -1,0 +1,115 @@
+service: ticket-inventory-service
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+  environment:
+    DYNAMODB_TABLE: ${self:service}-${self:provider.stage}
+    SQS_QUEUE_URL: !Ref TicketUpdatesQueue
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:Query
+            - dynamodb:Scan
+          Resource:
+            - !GetAtt TicketInventoryTable.Arn
+            - !Sub "${TicketInventoryTable.Arn}/index/*"
+        - Effect: Allow
+          Action:
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource: !GetAtt TicketUpdatesQueue.Arn
+
+functions:
+  getAvailability:
+    handler: dist/handlers/get-availability.handler
+    events:
+      - http:
+          path: /events/{eventId}/availability
+          method: get
+          cors: true
+      - http:
+          path: /availability
+          method: get
+          cors: true
+          request:
+            parameters:
+              querystrings:
+                startDate: false
+                endDate: false
+
+  ingestEvent:
+    handler: dist/handlers/ingest-event.handler
+    events:
+      - sqs:
+          arn: !GetAtt TicketUpdatesQueue.Arn
+          batchSize: 10
+
+  syncSchedule:
+    handler: dist/handlers/sync-schedule.handler
+    events:
+      - eventBridge:
+          schedule: rate(15 minutes)
+          enabled: true
+
+resources:
+  Resources:
+    TicketInventoryTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.DYNAMODB_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+          - AttributeName: GSI1PK
+            AttributeType: S
+          - AttributeName: GSI1SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: GSI1
+            KeySchema:
+              - AttributeName: GSI1PK
+                KeyType: HASH
+              - AttributeName: GSI1SK
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+    TicketUpdatesQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-updates
+        VisibilityTimeout: 60
+        MessageRetentionPeriod: 1209600
+        # Note: Using standard queue, not FIFO
+        # Messages may be delivered out of order
+
+plugins:
+  - serverless-offline
+
+custom:
+  serverless-offline:
+    httpPort: 3000
+    lambdaPort: 3002
